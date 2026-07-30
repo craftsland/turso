@@ -51,6 +51,18 @@ pub struct SqlGenBackend {
     policy: Policy,
 }
 
+fn disable_alter_actions_that_recheck_triggers(policy: &mut Policy) {
+    policy.alter_table_config.action_weights.rename_table = 0;
+    policy.alter_table_config.action_weights.drop_column = 0;
+    policy.alter_table_config.action_weights.rename_column = 0;
+}
+
+fn disable_prop_alter_actions_that_recheck_triggers(profile: &mut sql_gen_prop::StatementProfile) {
+    profile.alter_table.extra.rename_to = 0;
+    profile.alter_table.extra.drop_column = 0;
+    profile.alter_table.extra.rename_column = 0;
+}
+
 impl SqlGenBackend {
     pub fn new(seed: u64) -> Self {
         Self::new_with_window_weight(seed, 0.0)
@@ -100,7 +112,22 @@ impl SqlGenBackend {
 
 impl SqlGenerator for SqlGenBackend {
     fn generate(&mut self, schema: &sql_gen::Schema) -> Result<GeneratedStatement> {
-        let generator: SqlGen<Full> = SqlGen::new(schema.clone(), self.policy.clone());
+        let mut policy = self.policy.clone();
+        if !schema.triggers.is_empty() {
+            // A trigger on one table may refer to another table. SQLite lets
+            // the referenced table be dropped without removing the trigger.
+            // Both engines report the missing table if the trigger later runs,
+            // but SQLite also checks every stored trigger during a table
+            // rename, column rename, or column drop. Turso may accept the
+            // ALTER because it does not always check unrelated trigger errors.
+            // The fuzzer records the table a trigger belongs to, but not every
+            // table and column used by its body, so it cannot know whether an
+            // earlier DROP broke a remaining trigger. Do not generate these
+            // ALTER actions while triggers exist. Separate tests still cover
+            // them with triggers that are known to be valid.
+            disable_alter_actions_that_recheck_triggers(&mut policy);
+        }
+        let generator: SqlGen<Full> = SqlGen::new(schema.clone(), policy);
         let stmt = generator
             .statement(&mut self.ctx)
             .map_err(|e| anyhow::anyhow!("Failed to generate statement: {e}"))?;
@@ -175,14 +202,15 @@ impl PropTestBackend {
 impl SqlGenerator for PropTestBackend {
     fn generate(&mut self, schema: &sql_gen::Schema) -> Result<GeneratedStatement> {
         let prop_schema = to_prop_schema(schema);
-        let bootstrap_profile;
-        let profile = if self.recursive_cte_focus && prop_schema.tables.is_empty() {
-            bootstrap_profile = sql_gen_prop::StatementProfile::default();
-            &bootstrap_profile
+        let mut profile = if self.recursive_cte_focus && prop_schema.tables.is_empty() {
+            sql_gen_prop::StatementProfile::default()
         } else {
-            &self.profile
+            self.profile.clone()
         };
-        let strategy = sql_gen_prop::strategies::statement_for_schema(&prop_schema, profile);
+        if !schema.triggers.is_empty() {
+            disable_prop_alter_actions_that_recheck_triggers(&mut profile);
+        }
+        let strategy = sql_gen_prop::strategies::statement_for_schema(&prop_schema, &profile);
         let value_tree = strategy
             .new_tree(&mut self.test_runner)
             .map_err(|e| anyhow::anyhow!("Failed to generate statement: {e}"))?;
@@ -283,6 +311,14 @@ fn to_prop_schema(schema: &sql_gen::Schema) -> sql_gen_prop::Schema {
         }
         builder = builder.add_index(idx);
     }
+    for trigger in &schema.triggers {
+        let mut prop_trigger =
+            sql_gen_prop::Trigger::new(trigger.name.clone(), trigger.table_name.clone());
+        if let Some(db) = &trigger.database {
+            prop_trigger = prop_trigger.in_database(db.clone());
+        }
+        builder = builder.add_trigger(prop_trigger);
+    }
     builder.build()
 }
 
@@ -295,5 +331,22 @@ mod tests {
         let sql_gen = SqlGenBackend::new(1);
         assert_eq!(sql_gen.policy.update_config.or_ignore_probability, 0.0);
         assert_eq!(sql_gen.policy.update_config.self_join_probability, 0.0);
+    }
+
+    #[test]
+    fn triggers_disable_alter_actions_that_recheck_stored_triggers() {
+        let mut policy = Policy::default();
+        disable_alter_actions_that_recheck_triggers(&mut policy);
+        assert_eq!(policy.alter_table_config.action_weights.rename_table, 0);
+        assert_eq!(policy.alter_table_config.action_weights.drop_column, 0);
+        assert_eq!(policy.alter_table_config.action_weights.rename_column, 0);
+        assert_ne!(policy.alter_table_config.action_weights.add_column, 0);
+
+        let mut profile = sql_gen_prop::StatementProfile::default();
+        disable_prop_alter_actions_that_recheck_triggers(&mut profile);
+        assert_eq!(profile.alter_table.extra.rename_to, 0);
+        assert_eq!(profile.alter_table.extra.drop_column, 0);
+        assert_eq!(profile.alter_table.extra.rename_column, 0);
+        assert_ne!(profile.alter_table.extra.add_column, 0);
     }
 }
